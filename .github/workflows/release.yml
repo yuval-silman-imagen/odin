@@ -117,7 +117,12 @@ jobs:
     needs: macos
     # Runs after macos publishes the release, and alone when macos is skipped
     # (a branch dispatch). A failed macos build means no release to add to.
-    if: github.repository == 'danlinenberg/odin' && !failure() && !cancelled()
+    # ci/windows-build: temporarily allow a fork to build the unsigned Windows
+    # installer as a workflow artifact. Not for merging to main.
+    if: >-
+      (github.repository == 'danlinenberg/odin'
+        || github.repository == 'yuval-silman-imagen/odin')
+      && !failure() && !cancelled()
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
