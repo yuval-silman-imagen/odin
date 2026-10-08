@@ -1,72 +1,15 @@
 import type { RemoteConnectionConfig, TestConnectionResult } from "./types";
 
-/** Seconds to wait for the SSH handshake before giving up on a probe. */
-const SSH_CONNECT_TIMEOUT_SECONDS = 10;
-
 /** Markers the remote probe prints so we can parse its result unambiguously. */
 export const FOLDER_OK_MARKER = "ODIN_FOLDER_OK";
 export const NODE_OK_MARKER = "ODIN_NODE_OK";
 
 /**
  * Single-quote a string for a POSIX shell: wrap in single quotes and escape any
- * embedded single quote as '\''. Safe for arbitrary paths passed to the remote.
+ * embedded single quote as '\''. Safe for arbitrary paths run on the remote.
  */
 export function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-function sshTarget(config: RemoteConnectionConfig): string {
-	return `${config.username}@${config.host}`;
-}
-
-/**
- * The common `ssh`/`scp` options for a connection. `batch` disables password
- * prompts so a misconfigured key fails fast instead of hanging on a tty. The
- * `portFlag` differs between the two binaries (`-p` for ssh, `-P` for scp).
- */
-export function sshOptionArgs(
-	config: RemoteConnectionConfig,
-	options: { batch?: boolean; portFlag?: "-p" | "-P" } = {},
-): string[] {
-	const { batch = true, portFlag = "-p" } = options;
-	const args = [
-		portFlag,
-		String(config.sshPort),
-		"-o",
-		`ConnectTimeout=${SSH_CONNECT_TIMEOUT_SECONDS}`,
-		"-o",
-		"StrictHostKeyChecking=accept-new",
-	];
-	if (batch) args.push("-o", "BatchMode=yes");
-	if (config.sshKeyPath) args.push("-i", config.sshKeyPath);
-	return args;
-}
-
-/** Full argv for running a remote shell command over ssh. */
-export function buildSshCommandArgs(
-	config: RemoteConnectionConfig,
-	remoteCommand: string,
-): string[] {
-	return [...sshOptionArgs(config), sshTarget(config), remoteCommand];
-}
-
-/** Full argv for the `-L` tunnel: forward a local port to the remote loopback. */
-export function buildTunnelArgs(
-	config: RemoteConnectionConfig,
-	localPort: number,
-): string[] {
-	return [
-		"-N",
-		"-L",
-		`${localPort}:127.0.0.1:${config.remoteHostServicePort}`,
-		// Keep the tunnel from silently going dead on a dozing laptop's network.
-		"-o",
-		"ServerAliveInterval=15",
-		"-o",
-		"ServerAliveCountMax=3",
-		...sshOptionArgs(config),
-		sshTarget(config),
-	];
 }
 
 /**
@@ -159,7 +102,7 @@ export function buildRemoteStartCommand(
 		`HOST_MIGRATIONS_FOLDER=${shellQuote(params.migrationsDir)}`,
 		`ODIN_AGENT_HOOK_PORT=${shellQuote(String(params.hookPort))}`,
 		`ODIN_AGENT_HOOK_VERSION=${shellQuote(params.hookVersion)}`,
-		`NODE_ENV=production`,
+		"NODE_ENV=production",
 	].join(" ");
 	const healthProbe = buildRemoteHealthProbe(
 		config.remoteHostServicePort,

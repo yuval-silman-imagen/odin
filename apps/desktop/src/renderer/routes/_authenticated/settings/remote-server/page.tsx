@@ -1,6 +1,7 @@
 import { Button } from "@odin/ui/button";
 import { Input } from "@odin/ui/input";
 import { toast } from "@odin/ui/sonner";
+import { cn } from "@odin/ui/utils";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { LuTrash2 } from "react-icons/lu";
@@ -18,12 +19,16 @@ export const Route = createFileRoute("/_authenticated/settings/remote-server/")(
 	},
 );
 
+type AuthMethod = "key" | "password";
+
 interface ConnectionForm {
 	name: string;
 	host: string;
 	sshPort: string;
 	username: string;
+	authMethod: AuthMethod;
 	sshKeyPath: string;
+	password: string;
 	odinFolder: string;
 	remoteHostServicePort: string;
 }
@@ -33,7 +38,9 @@ const EMPTY_FORM: ConnectionForm = {
 	host: "",
 	sshPort: "22",
 	username: "",
+	authMethod: "key",
 	sshKeyPath: "",
+	password: "",
 	odinFolder: "~/.odin",
 	remoteHostServicePort: "48000",
 };
@@ -83,11 +90,13 @@ function RemoteServerSettings() {
 	});
 	const test = electronTrpc.remoteConnections.testConnection.useMutation();
 
-	const canSave =
+	const canSave = Boolean(
 		form.name.trim() &&
-		form.host.trim() &&
-		form.username.trim() &&
-		form.odinFolder.trim();
+			form.host.trim() &&
+			form.username.trim() &&
+			form.odinFolder.trim() &&
+			(form.authMethod === "key" || form.password),
+	);
 
 	const save = () => {
 		create.mutate({
@@ -95,7 +104,10 @@ function RemoteServerSettings() {
 			host: form.host.trim(),
 			sshPort: Number(form.sshPort) || 22,
 			username: form.username.trim(),
-			sshKeyPath: form.sshKeyPath.trim() || null,
+			authMethod: form.authMethod,
+			sshKeyPath:
+				form.authMethod === "key" ? form.sshKeyPath.trim() || null : null,
+			password: form.authMethod === "password" ? form.password : null,
 			odinFolder: form.odinFolder.trim(),
 			remoteHostServicePort: Number(form.remoteHostServicePort) || 48000,
 		});
@@ -226,17 +238,57 @@ function RemoteServerSettings() {
 					/>
 				</SettingRow>
 				<SettingRow
-					label="SSH key path"
-					htmlFor="remote-key"
-					description="Leave blank to use your SSH agent or default identity."
+					label="Authentication"
+					description="Log in with an SSH key or a username and password."
 				>
-					<Input
-						id="remote-key"
-						className="w-64"
-						placeholder="~/.ssh/id_ed25519"
-						{...field("sshKeyPath")}
-					/>
+					<div className="flex items-center gap-1 rounded-md bg-secondary p-0.5">
+						{(["key", "password"] as const).map((method) => (
+							<button
+								key={method}
+								type="button"
+								onClick={() =>
+									setForm((prev) => ({ ...prev, authMethod: method }))
+								}
+								className={cn(
+									"rounded px-2.5 py-1 text-xs font-medium capitalize transition-colors",
+									form.authMethod === method
+										? "bg-background text-foreground shadow-sm"
+										: "text-muted-foreground hover:text-foreground",
+								)}
+							>
+								{method === "key" ? "SSH key" : "Password"}
+							</button>
+						))}
+					</div>
 				</SettingRow>
+				{form.authMethod === "key" ? (
+					<SettingRow
+						label="SSH key path"
+						htmlFor="remote-key"
+						description="Leave blank to use your SSH agent or default identity."
+					>
+						<Input
+							id="remote-key"
+							className="w-64"
+							placeholder="~/.ssh/id_ed25519"
+							{...field("sshKeyPath")}
+						/>
+					</SettingRow>
+				) : (
+					<SettingRow
+						label="Password"
+						htmlFor="remote-password"
+						description="Stored encrypted on this machine with the OS keychain, never in plain text."
+					>
+						<Input
+							id="remote-password"
+							type="password"
+							className="w-64"
+							autoComplete="off"
+							{...field("password")}
+						/>
+					</SettingRow>
+				)}
 				<SettingRow label="Odin folder" htmlFor="remote-folder">
 					<Input
 						id="remote-folder"

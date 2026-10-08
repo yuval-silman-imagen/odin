@@ -278,8 +278,13 @@ export const remoteConnections = sqliteTable(
 		host: text("host").notNull(),
 		sshPort: integer("ssh_port").notNull().default(22),
 		username: text("username").notNull(),
+		// "key" uses sshKeyPath (or the default identity); "password" uses the
+		// encrypted password below.
+		authMethod: text("auth_method").notNull().default("key"),
 		// Null means rely on the local ssh agent / default identity.
 		sshKeyPath: text("ssh_key_path"),
+		// Encrypted at rest with Electron safeStorage; never stored in plaintext.
+		passwordEncrypted: text("password_encrypted"),
 		// Remote ODIN_HOME_DIR - holds the backend's logs, db, sockets and worktrees.
 		odinFolder: text("odin_folder").notNull(),
 		// Port the remote host-service listens on, forwarded to a local port.
