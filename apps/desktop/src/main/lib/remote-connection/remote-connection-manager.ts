@@ -1,6 +1,8 @@
 import * as childProcess from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import path from "node:path";
 import { app } from "electron";
 import log from "electron-log/main";
@@ -36,6 +38,13 @@ const SSH_COMMAND_TIMEOUT_MS = 20_000;
 const REMOTE_BACKEND_DIRNAME = "backend";
 const REMOTE_BUNDLE_NAME = "host-service.js";
 const REMOTE_MIGRATIONS_DIRNAME = "host-migrations";
+/**
+ * Bundle files the remote backend needs beside each other. host-worker.js is
+ * resolved next to host-service.js by the worker pool, so it must ship too.
+ * Native addons are not copied - they are installed on the remote for its own
+ * platform.
+ */
+const REMOTE_BUNDLE_FILES = ["host-service.js", "host-worker.js"];
 
 interface CommandResult {
 	code: number | null;
@@ -149,7 +158,6 @@ export class RemoteConnectionManager {
 
 	private async provisionRemote(config: RemoteConnectionConfig): Promise<void> {
 		const backendDir = `${config.odinFolder}/${REMOTE_BACKEND_DIRNAME}`;
-		const bundleSource = path.join(__dirname, REMOTE_BUNDLE_NAME);
 		const migrationsSource = app.isPackaged
 			? path.join(process.resourcesPath, "resources/host-migrations")
 			: path.join(app.getAppPath(), "../../packages/host-service/drizzle");
@@ -159,7 +167,25 @@ export class RemoteConnectionManager {
 			buildSshCommandArgs(config, `mkdir -p ${shellQuote(backendDir)}`),
 			"prepare the remote backend directory",
 		);
-		await this.scp(config, bundleSource, `${backendDir}/${REMOTE_BUNDLE_NAME}`);
+
+		// In a packaged app the bundle lives inside app.asar; Electron's fs reads
+		// it transparently but scp (an external binary) cannot. Stage each file to
+		// a real temp path first, then scp that.
+		const staged = this.stageBundleFiles();
+		try {
+			for (const file of staged) {
+				await this.scp(config, file.localPath, `${backendDir}/${file.name}`);
+			}
+		} finally {
+			for (const file of staged) {
+				try {
+					fs.rmSync(file.localPath, { force: true });
+				} catch {
+					// Temp file - best-effort cleanup.
+				}
+			}
+		}
+
 		await this.scp(
 			config,
 			migrationsSource,
@@ -184,6 +210,32 @@ export class RemoteConnectionManager {
 			buildSshCommandArgs(config, install),
 			"install the remote backend's native dependencies",
 		);
+	}
+
+	/**
+	 * Copy the backend bundle files out of their install location (inside
+	 * app.asar when packaged) into a temp dir scp can read. Reads go through
+	 * Electron's asar-aware fs; the returned paths are real files on disk.
+	 */
+	private stageBundleFiles(): { name: string; localPath: string }[] {
+		const sourceDir = __dirname;
+		const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), "odin-remote-"));
+		const staged: { name: string; localPath: string }[] = [];
+		for (const name of REMOTE_BUNDLE_FILES) {
+			const source = path.join(sourceDir, name);
+			if (!fs.existsSync(source)) {
+				// host-service.js is mandatory; a missing worker is logged, not fatal.
+				if (name === REMOTE_BUNDLE_NAME) {
+					throw new Error(`Backend bundle not found at ${source}`);
+				}
+				log.warn(`[remote-connection] bundle file missing, skipping: ${name}`);
+				continue;
+			}
+			const localPath = path.join(stageDir, name);
+			fs.writeFileSync(localPath, fs.readFileSync(source));
+			staged.push({ name, localPath });
+		}
+		return staged;
 	}
 
 	private async startRemoteBackend(
