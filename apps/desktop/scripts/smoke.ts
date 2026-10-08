@@ -437,6 +437,26 @@ await step("a new profile sees none of the first one's tasks", async () => {
 	await waitForText(TASK);
 });
 
+await step(
+	"the backend connection indicator and settings are reachable",
+	async () => {
+		// The top-bar indicator always renders; its dropdown says where the backend
+		// runs. No remote is configured in the throwaway home, so it reads "Local".
+		await rail("Dev Board");
+		await click("button", "Backend running locally");
+		await waitForText("Run the backend on");
+		await page(
+			`(document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`,
+		);
+		await waitForText("Run the backend on", false);
+		// The Remote server settings screen mounts from the sidebar.
+		await rail("Settings");
+		await click("a", "Remote server");
+		await waitForText("Add a connection");
+		await click("a", "Back");
+	},
+);
+
 await step("starting a task asks for optional context first", async () => {
 	await rail("Tasks");
 	await waitForText(TASK);

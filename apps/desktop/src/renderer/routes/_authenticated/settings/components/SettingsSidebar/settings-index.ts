@@ -4,6 +4,7 @@ import {
 	LuListOrdered,
 	LuPalette,
 	LuPlug,
+	LuServer,
 	LuSquareTerminal,
 } from "react-icons/lu";
 
@@ -48,6 +49,12 @@ export const SCREENS = [
 		label: "Keyboard",
 		hint: "Shortcuts for every screen",
 		icon: LuKeyboard,
+	},
+	{
+		to: "/settings/remote-server",
+		label: "Remote server",
+		hint: "Run the backend over SSH, keep agents alive",
+		icon: LuServer,
 	},
 ] as const;
 
@@ -248,6 +255,25 @@ export const SETTINGS_INDEX: SettingEntry[] = [
 		section: "From any app",
 		keywords:
 			"double tap global hotkey open hide odin anywhere key mapping button synergy",
+	},
+	{
+		label: "Remote server",
+		to: "/settings/remote-server",
+		section: "Remote server",
+		keywords:
+			"ssh remote backend host run agents offload tunnel machine server",
+	},
+	{
+		label: "Server address",
+		to: "/settings/remote-server",
+		section: "Add a connection",
+		keywords: "ip hostname host address ssh remote",
+	},
+	{
+		label: "Odin folder",
+		to: "/settings/remote-server",
+		section: "Add a connection",
+		keywords: "odin home dir folder path remote logs database worktrees",
 	},
 ];
 
