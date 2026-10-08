@@ -41,6 +41,7 @@ import {
 	useDueReminders,
 	useReminders,
 } from "./components/Reminders";
+import { RemoteConnectionIndicator } from "./components/RemoteConnectionIndicator";
 import { SearchAll } from "./components/SearchAll";
 import { SessionContextDialog } from "./components/SessionContextDialog";
 import { QuickAddTask } from "./components/TaskBox";
@@ -549,6 +550,7 @@ function OdinShell() {
 				<div className="h-full min-w-0 flex-1 [-webkit-app-region:drag]" />
 				<ZoomStable enabled={isMac}>
 					<div className="flex items-center gap-1.5">
+						<RemoteConnectionIndicator />
 						<ClaudeCommandPicker />
 						{usage && (usage.fiveHour || usage.week) && (
 							<Tooltip delayDuration={300}>
