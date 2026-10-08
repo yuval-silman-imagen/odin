@@ -9,13 +9,18 @@ export type RemoteConnectionStatus =
  * The subset of a `remote_connections` row the manager needs to reach a host.
  * Credentials never live here beyond the path to an SSH key.
  */
+export type RemoteAuthMethod = "key" | "password";
+
 export interface RemoteConnectionConfig {
 	id: string;
 	name: string;
 	host: string;
 	sshPort: number;
 	username: string;
+	authMethod: RemoteAuthMethod;
 	sshKeyPath: string | null;
+	/** Decrypted password for `authMethod: "password"`; never persisted in clear. */
+	password: string | null;
 	odinFolder: string;
 	remoteHostServicePort: number;
 }

@@ -4,6 +4,7 @@ export {
 } from "./remote-connection-manager";
 export type {
 	ActiveRemote,
+	RemoteAuthMethod,
 	RemoteConnectionConfig,
 	RemoteConnectionStatus,
 	RemoteConnectionStatusEvent,

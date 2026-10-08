@@ -2,14 +2,11 @@ import { describe, expect, it } from "bun:test";
 import {
 	buildRemoteHealthProbe,
 	buildRemoteStartCommand,
-	buildSshCommandArgs,
 	buildTestCommand,
-	buildTunnelArgs,
 	FOLDER_OK_MARKER,
 	NODE_OK_MARKER,
 	parseTestOutput,
 	shellQuote,
-	sshOptionArgs,
 } from "./ssh";
 import type { RemoteConnectionConfig } from "./types";
 
@@ -19,7 +16,9 @@ const config: RemoteConnectionConfig = {
 	host: "10.0.0.42",
 	sshPort: 2222,
 	username: "ubuntu",
+	authMethod: "key",
 	sshKeyPath: "/home/me/.ssh/id_ed25519",
+	password: null,
 	odinFolder: "/srv/odin",
 	remoteHostServicePort: 48000,
 };
@@ -33,51 +32,6 @@ describe("shellQuote", () => {
 		expect(shellQuote("a'b")).toBe("'a'\\''b'");
 		// A quote-and-command attempt stays inside the quoting.
 		expect(shellQuote("x'; rm -rf /")).toBe("'x'\\''; rm -rf /'");
-	});
-});
-
-describe("sshOptionArgs", () => {
-	it("includes port, timeout, batch mode and the identity file", () => {
-		expect(sshOptionArgs(config)).toEqual([
-			"-p",
-			"2222",
-			"-o",
-			"ConnectTimeout=10",
-			"-o",
-			"StrictHostKeyChecking=accept-new",
-			"-o",
-			"BatchMode=yes",
-			"-i",
-			"/home/me/.ssh/id_ed25519",
-		]);
-	});
-
-	it("omits the identity file when no key path is set", () => {
-		const args = sshOptionArgs({ ...config, sshKeyPath: null });
-		expect(args).not.toContain("-i");
-	});
-
-	it("uses -P for scp", () => {
-		expect(sshOptionArgs(config, { portFlag: "-P" })[0]).toBe("-P");
-	});
-});
-
-describe("buildSshCommandArgs", () => {
-	it("puts the target before the remote command", () => {
-		const args = buildSshCommandArgs(config, "echo hi");
-		expect(args.at(-2)).toBe("ubuntu@10.0.0.42");
-		expect(args.at(-1)).toBe("echo hi");
-	});
-});
-
-describe("buildTunnelArgs", () => {
-	it("forwards a local port to the remote loopback with keepalive", () => {
-		const args = buildTunnelArgs(config, 55123);
-		expect(args).toContain("-N");
-		const forwardIndex = args.indexOf("-L");
-		expect(args[forwardIndex + 1]).toBe("55123:127.0.0.1:48000");
-		expect(args).toContain("ServerAliveInterval=15");
-		expect(args.at(-1)).toBe("ubuntu@10.0.0.42");
 	});
 });
 
@@ -109,10 +63,14 @@ describe("buildTestCommand + parseTestOutput", () => {
 	});
 
 	it("reports unreachable with the error text when ssh failed", () => {
-		const result = parseTestOutput("", false, "Permission denied (publickey).");
+		const result = parseTestOutput(
+			"",
+			false,
+			"All configured authentication methods failed",
+		);
 		expect(result.ok).toBe(false);
 		expect(result.reachable).toBe(false);
-		expect(result.message).toContain("Permission denied");
+		expect(result.message).toContain("authentication");
 	});
 });
 

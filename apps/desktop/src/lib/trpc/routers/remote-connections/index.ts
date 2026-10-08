@@ -2,9 +2,11 @@ import { remoteConnections } from "@odin/local-db";
 import { TRPCError } from "@trpc/server";
 import { observable } from "@trpc/server/observable";
 import { eq } from "drizzle-orm";
+import { safeStorage } from "electron";
 import { localDb } from "main/lib/local-db";
 import {
 	getRemoteConnectionManager,
+	type RemoteAuthMethod,
 	type RemoteConnectionConfig,
 	type RemoteConnectionStatusEvent,
 } from "main/lib/remote-connection";
@@ -16,7 +18,10 @@ const connectionInput = z.object({
 	host: z.string().min(1),
 	sshPort: z.number().int().positive().max(65_535).default(22),
 	username: z.string().min(1),
+	authMethod: z.enum(["key", "password"]).default("key"),
 	sshKeyPath: z.string().nullable().default(null),
+	// Plaintext here; encrypted with safeStorage before it touches the DB.
+	password: z.string().nullable().default(null),
 	odinFolder: z.string().min(1),
 	remoteHostServicePort: z
 		.number()
@@ -28,6 +33,35 @@ const connectionInput = z.object({
 
 const idInput = z.object({ id: z.string().min(1) });
 
+/**
+ * Encrypt a password for storage. `undefined` means "leave unchanged" on an
+ * update; `null`/empty clears it. Throws when the OS keychain is unavailable so
+ * a password is never written in clear.
+ */
+function encryptPassword(
+	plain: string | null | undefined,
+): string | null | undefined {
+	if (plain === undefined) return undefined;
+	if (!plain) return null;
+	if (!safeStorage.isEncryptionAvailable()) {
+		throw new TRPCError({
+			code: "INTERNAL_SERVER_ERROR",
+			message:
+				"Secure storage is unavailable on this machine, so a password cannot be saved. Use an SSH key instead.",
+		});
+	}
+	return safeStorage.encryptString(plain).toString("base64");
+}
+
+function decryptPassword(encrypted: string | null): string | null {
+	if (!encrypted) return null;
+	try {
+		return safeStorage.decryptString(Buffer.from(encrypted, "base64"));
+	} catch {
+		return null;
+	}
+}
+
 function toConfig(
 	row: typeof remoteConnections.$inferSelect,
 ): RemoteConnectionConfig {
@@ -37,7 +71,9 @@ function toConfig(
 		host: row.host,
 		sshPort: row.sshPort,
 		username: row.username,
+		authMethod: row.authMethod as RemoteAuthMethod,
 		sshKeyPath: row.sshKeyPath,
+		password: decryptPassword(row.passwordEncrypted),
 		odinFolder: row.odinFolder,
 		remoteHostServicePort: row.remoteHostServicePort,
 	};
@@ -73,9 +109,13 @@ export const createRemoteConnectionsRouter = () => {
 		}),
 
 		create: publicProcedure.input(connectionInput).mutation(({ input }) => {
+			const { password, ...rest } = input;
 			return localDb
 				.insert(remoteConnections)
-				.values({ ...input })
+				.values({
+					...rest,
+					passwordEncrypted: encryptPassword(password) ?? null,
+				})
 				.returning()
 				.get();
 		}),
@@ -83,11 +123,18 @@ export const createRemoteConnectionsRouter = () => {
 		update: publicProcedure
 			.input(idInput.extend(connectionInput.partial().shape))
 			.mutation(({ input }) => {
-				const { id, ...patch } = input;
+				const { id, password, ...patch } = input;
 				requireRow(id);
+				const encrypted = encryptPassword(password);
 				return localDb
 					.update(remoteConnections)
-					.set({ ...patch, updatedAt: Date.now() })
+					.set({
+						...patch,
+						...(encrypted === undefined
+							? {}
+							: { passwordEncrypted: encrypted }),
+						updatedAt: Date.now(),
+					})
 					.where(eq(remoteConnections.id, id))
 					.returning()
 					.get();
