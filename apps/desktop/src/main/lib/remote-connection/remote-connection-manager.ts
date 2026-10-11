@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -15,9 +15,14 @@ import {
 } from "../host-service-utils";
 import { HOOK_PROTOCOL_VERSION } from "../terminal/env";
 import {
+	ALREADY_RUNNING_MARKER,
+	buildProvisionCommand,
 	buildRemoteStartCommand,
 	buildTestCommand,
+	collectBundleFiles,
 	parseTestOutput,
+	REMOTE_AUTH_PROBE_PATH,
+	REMOTE_RUNTIME_DEPS,
 	shellQuote,
 } from "./ssh";
 import type {
@@ -37,17 +42,19 @@ const REMOTE_BACKEND_DIRNAME = "backend";
 const REMOTE_BUNDLE_NAME = "host-service.js";
 const REMOTE_MIGRATIONS_DIRNAME = "host-migrations";
 /**
- * Bundle files the remote backend needs beside each other. host-worker.js is
- * resolved next to host-service.js by the worker pool, so it must ship too.
- * Native addons are not copied - they are installed on the remote for its own
- * platform.
+ * Bundle entry points the remote backend needs beside each other. The worker
+ * pool resolves host-worker.js and the daemon supervisor resolves
+ * pty-daemon.js next to host-service.js. The chunks they load are collected
+ * from these by {@link collectBundleFiles}. Native addons are not copied -
+ * they are installed on the remote for its own platform.
  */
-const REMOTE_BUNDLE_FILES = ["host-service.js", "host-worker.js"];
-/**
- * Native deps the externalized host-service bundle needs, pinned to the app's
- * own versions so the ABI matches. Installed on the remote for its platform.
- */
-const REMOTE_NATIVE_DEPS = ["better-sqlite3@12.6.2", "node-pty@1.2.0-beta.14"];
+const REMOTE_BUNDLE_ENTRIES = [
+	"host-service.js",
+	"host-worker.js",
+	"pty-daemon.js",
+];
+/** Log lines quoted back when the remote backend fails to come up. */
+const REMOTE_LOG_TAIL_LINES = 30;
 
 interface CommandResult {
 	code: number | null;
@@ -132,17 +139,21 @@ export class RemoteConnectionManager {
 	 */
 	async connect(config: RemoteConnectionConfig): Promise<ActiveRemote> {
 		this.closeActive();
-		const secret = randomBytes(32).toString("hex");
 		const localPort = await findFreePort();
 		this.setStatus(config, "connecting", localPort, null);
 
 		let client: Client | null = null;
+		let resolved: RemoteConnectionConfig = config;
 		try {
 			const readyClient = await this.openClient(config);
 			client = readyClient;
-			const resolved = await this.resolveConfig(readyClient, config);
-			await this.provisionRemote(readyClient, resolved);
-			await this.startRemoteBackend(readyClient, resolved, secret);
+			resolved = await this.resolveConfig(readyClient, config);
+			const bundleHash = await this.provisionRemote(readyClient, resolved);
+			const secret = await this.startRemoteBackend(
+				readyClient,
+				resolved,
+				bundleHash,
+			);
 
 			const server = this.openTunnel(
 				readyClient,
@@ -159,8 +170,25 @@ export class RemoteConnectionManager {
 				() => this.client !== readyClient,
 			);
 			if (!healthy) {
+				const logTail = await this.readRemoteLogTail(readyClient, resolved);
 				throw new Error(
-					`Remote host-service did not answer on the tunnel within ${HEALTH_POLL_TIMEOUT_MS}ms.`,
+					`Remote host-service did not answer on the tunnel within ${HEALTH_POLL_TIMEOUT_MS}ms.${
+						logTail
+							? `\n\nLast lines of ${resolved.odinFolder}/host-service.log:\n${logTail}`
+							: ""
+					}`,
+				);
+			}
+
+			// health.check is public; prove the secret before the renderer
+			// gets a wall of 401s.
+			const auth = await fetch(
+				`http://127.0.0.1:${localPort}${REMOTE_AUTH_PROBE_PATH}`,
+				{ headers: { Authorization: `Bearer ${secret}` } },
+			);
+			if (auth.status === 401) {
+				throw new Error(
+					"The remote host-service rejected this app's credentials. Restart it on the server and connect again.",
 				);
 			}
 
@@ -288,73 +316,70 @@ export class RemoteConnectionManager {
 		};
 	}
 
+	/**
+	 * Ship the backend bundle (entries + chunks) and migrations, and install
+	 * its runtime deps for the remote's platform. Returns the bundle's content
+	 * hash so the start step can tell a current daemon from a stale one.
+	 */
 	private async provisionRemote(
 		client: Client,
 		config: RemoteConnectionConfig,
-	): Promise<void> {
+	): Promise<string> {
 		const backendDir = `${config.odinFolder}/${REMOTE_BACKEND_DIRNAME}`;
 		const migrationsSource = app.isPackaged
 			? path.join(process.resourcesPath, "resources/host-migrations")
 			: path.join(app.getAppPath(), "../../packages/host-service/drizzle");
 
-		await this.execChecked(
-			client,
-			`mkdir -p ${shellQuote(backendDir)}`,
-			"prepare the remote backend directory",
-		);
-
-		const sftp = await this.openSftp(client);
+		const staged = this.stageBundleFiles();
 		try {
-			const staged = this.stageBundleFiles();
-			try {
-				for (const file of staged) {
-					await this.putFile(
-						sftp,
-						file.localPath,
-						`${backendDir}/${file.name}`,
-					);
+			const running = await this.exec(
+				client,
+				`cat ${shellQuote(`${backendDir}/.running-bundle`)} 2>/dev/null`,
+			);
+			// The daemon already runs exactly this bundle: nothing to copy.
+			if (running.stdout.trim() !== staged.hash) {
+				const remoteDirs = new Set([backendDir]);
+				for (const file of staged.files) {
+					remoteDirs.add(path.posix.dirname(`${backendDir}/${file.name}`));
 				}
-			} finally {
-				for (const file of staged) {
-					try {
-						fs.rmSync(file.localPath, { force: true });
-					} catch {
-						// Temp file - best-effort cleanup.
+				await this.execChecked(
+					client,
+					`mkdir -p ${[...remoteDirs].map(shellQuote).join(" ")}`,
+					"prepare the remote backend directory",
+				);
+				const sftp = await this.openSftp(client);
+				try {
+					for (const file of staged.files) {
+						await this.putFile(
+							sftp,
+							file.localPath,
+							`${backendDir}/${file.name}`,
+						);
 					}
+					await this.putDir(
+						client,
+						sftp,
+						migrationsSource,
+						`${backendDir}/${REMOTE_MIGRATIONS_DIRNAME}`,
+					);
+				} finally {
+					sftp.end();
 				}
 			}
-			await this.putDir(
-				client,
-				sftp,
-				migrationsSource,
-				`${backendDir}/${REMOTE_MIGRATIONS_DIRNAME}`,
-			);
 		} finally {
-			sftp.end();
+			try {
+				fs.rmSync(staged.dir, { recursive: true, force: true });
+			} catch {
+				// Temp dir - best-effort cleanup.
+			}
 		}
 
-		// First-cut native-dep install, guarded by a marker. The host-service
-		// bundle externalizes better-sqlite3 and node-pty, so they must be built
-		// for the remote's platform. Hardening (ABI pinning, a prebuilt package)
-		// is a follow-up - see the feature plan.
-		// npm_config_libc=glibc: without it prebuild-install reports an empty libc
-		// and misses the prebuilt binary, falling back to a source compile that
-		// needs a full C/C++ toolchain. Forcing glibc grabs the prebuilt on a
-		// standard Linux server so no compiler is required.
-		const marker = `${backendDir}/.provisioned`;
-		const deps = REMOTE_NATIVE_DEPS.map(shellQuote).join(" ");
-		const install = [
-			`if [ ! -f ${shellQuote(marker)} ]; then`,
-			`cd ${shellQuote(backendDir)}`,
-			`&& printf '%s' '{"name":"odin-remote-backend","private":true}' > package.json`,
-			`&& npm_config_libc=glibc npm install --no-audit --no-fund ${deps}`,
-			`&& touch ${shellQuote(marker)}; fi`,
-		].join(" ");
 		await this.execChecked(
 			client,
-			install,
-			"install the remote backend's native dependencies",
+			buildProvisionCommand(backendDir, REMOTE_RUNTIME_DEPS),
+			"install the remote backend's npm dependencies",
 		);
+		return staged.hash;
 	}
 
 	/**
@@ -362,42 +387,116 @@ export class RemoteConnectionManager {
 	 * app.asar when packaged) into a temp dir sftp can read. Reads go through
 	 * Electron's asar-aware fs; the returned paths are real files on disk.
 	 */
-	private stageBundleFiles(): { name: string; localPath: string }[] {
+	private stageBundleFiles(): {
+		dir: string;
+		hash: string;
+		files: { name: string; localPath: string }[];
+	} {
 		const sourceDir = __dirname;
-		const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), "odin-remote-"));
-		const staged: { name: string; localPath: string }[] = [];
-		for (const name of REMOTE_BUNDLE_FILES) {
-			const source = path.join(sourceDir, name);
-			if (!fs.existsSync(source)) {
-				if (name === REMOTE_BUNDLE_NAME) {
-					throw new Error(`Backend bundle not found at ${source}`);
-				}
-				log.warn(`[remote-connection] bundle file missing, skipping: ${name}`);
-				continue;
-			}
-			const localPath = path.join(stageDir, name);
-			fs.writeFileSync(localPath, fs.readFileSync(source));
-			staged.push({ name, localPath });
+		if (!fs.existsSync(path.join(sourceDir, REMOTE_BUNDLE_NAME))) {
+			throw new Error(
+				`Backend bundle not found at ${path.join(sourceDir, REMOTE_BUNDLE_NAME)}`,
+			);
 		}
-		return staged;
+		const names = collectBundleFiles(REMOTE_BUNDLE_ENTRIES, (rel) => {
+			const source = path.join(sourceDir, rel);
+			return fs.existsSync(source) ? fs.readFileSync(source, "utf8") : null;
+		});
+		for (const entry of REMOTE_BUNDLE_ENTRIES) {
+			if (!names.includes(entry)) {
+				log.warn(`[remote-connection] bundle file missing, skipping: ${entry}`);
+			}
+		}
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "odin-remote-"));
+		const hash = createHash("sha256");
+		const files = names.map((name) => {
+			const content = fs.readFileSync(path.join(sourceDir, name));
+			hash.update(name).update("\0").update(content);
+			const localPath = path.join(dir, name);
+			fs.mkdirSync(path.dirname(localPath), { recursive: true });
+			fs.writeFileSync(localPath, content);
+			return { name, localPath };
+		});
+		return { dir, hash: hash.digest("hex"), files };
 	}
 
+	/**
+	 * Start the remote backend, or adopt the one already running, and return
+	 * the secret it answers to.
+	 */
 	private async startRemoteBackend(
 		client: Client,
 		config: RemoteConnectionConfig,
-		secret: string,
-	): Promise<void> {
+		bundleHash: string,
+	): Promise<string> {
 		const bundlePath = `${config.odinFolder}/${REMOTE_BACKEND_DIRNAME}/${REMOTE_BUNDLE_NAME}`;
 		const migrationsDir = `${config.odinFolder}/${REMOTE_BACKEND_DIRNAME}/${REMOTE_MIGRATIONS_DIRNAME}`;
+		const existing = await this.readRemoteManifest(client, config);
+		const secret = randomBytes(32).toString("hex");
 		const command = buildRemoteStartCommand(config, {
 			secret,
+			existing,
+			bundleHash,
 			organizationId: REMOTE_ORGANIZATION_ID,
 			bundlePath,
 			migrationsDir,
 			hookPort: sharedEnv.DESKTOP_NOTIFICATIONS_PORT,
 			hookVersion: HOOK_PROTOCOL_VERSION,
+			vitePort: sharedEnv.DESKTOP_VITE_PORT,
 		});
-		await this.execChecked(client, command, "start the remote host-service");
+		const result = await this.execChecked(
+			client,
+			command,
+			"start the remote host-service",
+		);
+		if (existing && result.stdout.includes(ALREADY_RUNNING_MARKER)) {
+			log.info("[remote-connection] adopted the running remote host-service");
+			return existing.secret;
+		}
+		return secret;
+	}
+
+	/** pid + secret of the daemon a previous connect left running, if any. */
+	private async readRemoteManifest(
+		client: Client,
+		config: RemoteConnectionConfig,
+	): Promise<{ secret: string; pid: number } | null> {
+		const manifestPath = `${config.odinFolder}/host/${REMOTE_ORGANIZATION_ID}/manifest.json`;
+		const result = await this.exec(
+			client,
+			`cat ${shellQuote(manifestPath)} 2>/dev/null`,
+		);
+		try {
+			const data = JSON.parse(result.stdout) as {
+				pid?: unknown;
+				authToken?: unknown;
+			};
+			if (
+				typeof data.authToken === "string" &&
+				data.authToken &&
+				Number.isInteger(data.pid)
+			) {
+				return { secret: data.authToken, pid: data.pid as number };
+			}
+		} catch {
+			// No manifest yet, or a torn write - start fresh.
+		}
+		return null;
+	}
+
+	private async readRemoteLogTail(
+		client: Client,
+		config: RemoteConnectionConfig,
+	): Promise<string> {
+		try {
+			const result = await this.exec(
+				client,
+				`tail -n ${REMOTE_LOG_TAIL_LINES} ${shellQuote(`${config.odinFolder}/host-service.log`)} 2>/dev/null`,
+			);
+			return result.stdout.trim();
+		} catch {
+			return "";
+		}
 	}
 
 	private openTunnel(
