@@ -43,6 +43,11 @@ const REMOTE_MIGRATIONS_DIRNAME = "host-migrations";
  * platform.
  */
 const REMOTE_BUNDLE_FILES = ["host-service.js", "host-worker.js"];
+/**
+ * Native deps the externalized host-service bundle needs, pinned to the app's
+ * own versions so the ABI matches. Installed on the remote for its platform.
+ */
+const REMOTE_NATIVE_DEPS = ["better-sqlite3@12.6.2", "node-pty@1.2.0-beta.14"];
 
 interface CommandResult {
 	code: number | null;
@@ -106,7 +111,8 @@ export class RemoteConnectionManager {
 		let client: Client | null = null;
 		try {
 			client = await this.openClient(config);
-			const result = await this.exec(client, buildTestCommand(config));
+			const resolved = await this.resolveConfig(client, config);
+			const result = await this.exec(client, buildTestCommand(resolved));
 			return parseTestOutput(result.stdout, true, result.stderr);
 		} catch (error) {
 			return parseTestOutput(
@@ -134,8 +140,9 @@ export class RemoteConnectionManager {
 		try {
 			const readyClient = await this.openClient(config);
 			client = readyClient;
-			await this.provisionRemote(readyClient, config);
-			await this.startRemoteBackend(readyClient, config, secret);
+			const resolved = await this.resolveConfig(readyClient, config);
+			await this.provisionRemote(readyClient, resolved);
+			await this.startRemoteBackend(readyClient, resolved, secret);
 
 			const server = this.openTunnel(
 				readyClient,
@@ -259,6 +266,28 @@ export class RemoteConnectionManager {
 		);
 	}
 
+	/**
+	 * Expand a leading `~` in the odin folder to the remote home directory.
+	 * The folder is quoted in shell commands (so the shell never expands `~`)
+	 * and sftp cannot expand it either, so resolve it once against the real
+	 * remote `$HOME`.
+	 */
+	private async resolveConfig(
+		client: Client,
+		config: RemoteConnectionConfig,
+	): Promise<RemoteConnectionConfig> {
+		if (!config.odinFolder.startsWith("~")) return config;
+		const result = await this.exec(client, 'printf %s "$HOME"');
+		const home = result.stdout.trim();
+		if (!home) {
+			throw new Error("Could not resolve the remote home directory.");
+		}
+		return {
+			...config,
+			odinFolder: config.odinFolder.replace(/^~(?=\/|$)/, home),
+		};
+	}
+
 	private async provisionRemote(
 		client: Client,
 		config: RemoteConnectionConfig,
@@ -308,12 +337,17 @@ export class RemoteConnectionManager {
 		// bundle externalizes better-sqlite3 and node-pty, so they must be built
 		// for the remote's platform. Hardening (ABI pinning, a prebuilt package)
 		// is a follow-up - see the feature plan.
+		// npm_config_libc=glibc: without it prebuild-install reports an empty libc
+		// and misses the prebuilt binary, falling back to a source compile that
+		// needs a full C/C++ toolchain. Forcing glibc grabs the prebuilt on a
+		// standard Linux server so no compiler is required.
 		const marker = `${backendDir}/.provisioned`;
+		const deps = REMOTE_NATIVE_DEPS.map(shellQuote).join(" ");
 		const install = [
 			`if [ ! -f ${shellQuote(marker)} ]; then`,
 			`cd ${shellQuote(backendDir)}`,
 			`&& printf '%s' '{"name":"odin-remote-backend","private":true}' > package.json`,
-			`&& npm install --no-audit --no-fund better-sqlite3 node-pty`,
+			`&& npm_config_libc=glibc npm install --no-audit --no-fund ${deps}`,
 			`&& touch ${shellQuote(marker)}; fi`,
 		].join(" ");
 		await this.execChecked(
