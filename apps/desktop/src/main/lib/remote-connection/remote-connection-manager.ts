@@ -367,11 +367,12 @@ export class RemoteConnectionManager {
 				}
 			}
 		} finally {
-			try {
-				fs.rmSync(staged.dir, { recursive: true, force: true });
-			} catch {
-				// Temp dir - best-effort cleanup.
-			}
+			// Async: a sync recursive delete would stall the main process.
+			await fs.promises
+				.rm(staged.dir, { recursive: true, force: true })
+				.catch(() => {
+					// Temp dir - best-effort cleanup.
+				});
 		}
 
 		await this.execChecked(

@@ -446,7 +446,14 @@ await step(
 		// The top-bar indicator always renders; its dropdown says where the backend
 		// runs. No remote is configured in the throwaway home, so it reads "Local".
 		await rail("Dev Board");
-		await click("button", "Backend running locally");
+		// A Radix menu trigger opens on pointerdown; a bare click() never fires it.
+		const opened = await page<boolean>(`(() => {
+			const e = __find("button", "Backend running locally");
+			e?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerType: "mouse" }));
+			return !!e;
+		})()`);
+		if (!opened)
+			throw new Error('no button labelled "Backend running locally"');
 		await waitForText("Run the backend on");
 		await page(
 			`(document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`,
@@ -640,7 +647,7 @@ await step("Done takes a task off the list", async () => {
 	await waitForText(TASK, false);
 });
 
-// Settings is seven fixed screens; each sidebar link and the route it opens.
+// Settings is eight fixed screens; each sidebar link and the route it opens.
 const SETTINGS: [string, string][] = [
 	["Connections", "#/settings/connections"],
 	["Sessions", "#/settings/sessions"],
@@ -649,8 +656,9 @@ const SETTINGS: [string, string][] = [
 	["Notifications", "#/settings/ringtones"],
 	["Appearance", "#/settings/appearance"],
 	["Keyboard", "#/settings/keyboard"],
+	["Remote server", "#/settings/remote-server"],
 ];
-await step("Settings: exactly its seven screens, and each opens", async () => {
+await step("Settings: exactly its eight screens, and each opens", async () => {
 	await rail("Settings");
 	await waitForText("profiles");
 	const links = await page<string[]>(
@@ -665,7 +673,8 @@ await step("Settings: exactly its seven screens, and each opens", async () => {
 		if (!hash.startsWith(route)) throw new Error(`${label} opened ${hash}`);
 		await expectHealthy();
 	}
-	// Keyboard is the last screen: its search narrows the list.
+	// Keyboard's search narrows the list.
+	await click("a", "Keyboard");
 	await fill('input[aria-label="Search shortcuts"]', "undo");
 	await waitForText("next session", false);
 	await waitForText("undo the last done");
