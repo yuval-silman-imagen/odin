@@ -180,3 +180,60 @@ jobs:
         with:
           name: Odin-Setup-x64
           path: apps/desktop/release/Odin-Setup-x64.exe
+
+  # ci/windows-build: a fork's Mac build, as a workflow artifact - the same
+  # self-signed scheme as releases (no Apple notarization), with a certificate
+  # minted for this build since forks don't hold ODIN_SIGNING_P12. Not for
+  # merging to main.
+  macos-fork:
+    if: github.repository == 'yuval-silman-imagen/odin'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SKIP_ENV_VALIDATION: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run --filter=@odin/desktop install:deps
+
+      # create-signing-identity.sh imports ODIN_SIGNING_P12 and trusts it; in
+      # CI it refuses to mint one itself, so mint it here, exactly as it would.
+      - name: Mint this build's signing certificate
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          printf '%s\n' '[req]' 'distinguished_name = dn' 'x509_extensions = v3' 'prompt = no' \
+            '[dn]' 'CN = Odin Local Signing' \
+            '[v3]' 'basicConstraints = critical,CA:false' 'keyUsage = critical,digitalSignature' \
+            'extendedKeyUsage = critical,codeSigning' > "$tmp/openssl.cnf"
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -sha256 -days 7300 -nodes \
+            -keyout "$tmp/key.pem" -out "$tmp/cert.pem" -config "$tmp/openssl.cnf" 2>/dev/null
+          /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+            -out "$tmp/identity.p12" -passout pass:odin-signing -name "Odin Local Signing" \
+            -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+          echo "ODIN_SIGNING_P12=$(base64 < "$tmp/identity.p12" | tr -d '\n')" >> "$GITHUB_ENV"
+          rm -rf "$tmp"
+
+      - run: bun run build
+        env:
+          ODIN_SLACK_CLIENT_ID: ${{ secrets.ODIN_SLACK_CLIENT_ID }}
+          ODIN_SLACK_CLIENT_SECRET: ${{ secrets.ODIN_SLACK_CLIENT_SECRET }}
+          ODIN_SLACK_REDIRECT_URL: ${{ secrets.ODIN_SLACK_REDIRECT_URL }}
+          ODIN_GITHUB_CLIENT_ID: ${{ secrets.ODIN_GITHUB_CLIENT_ID }}
+          ODIN_NOTION_CLIENT_ID: ${{ secrets.ODIN_NOTION_CLIENT_ID }}
+          ODIN_NOTION_CLIENT_SECRET: ${{ secrets.ODIN_NOTION_CLIENT_SECRET }}
+          ODIN_NOTION_REDIRECT_URL: ${{ secrets.ODIN_NOTION_REDIRECT_URL }}
+          ODIN_JIRA_CLIENT_ID: ${{ secrets.ODIN_JIRA_CLIENT_ID }}
+          ODIN_JIRA_CLIENT_SECRET: ${{ secrets.ODIN_JIRA_CLIENT_SECRET }}
+          ODIN_JIRA_REDIRECT_URL: ${{ secrets.ODIN_JIRA_REDIRECT_URL }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Odin-arm64
+          path: apps/desktop/release/*.dmg
